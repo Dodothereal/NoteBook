@@ -23,23 +23,17 @@ export const CLAUDE_MODELS = {
  */
 export async function sendMessageToClaude(prompt, modelId, messages = [], files = [], extendedThinking = false) {
     try {
-        // Format messages for Claude API
-        const formattedMessages = formatMessagesForClaude(messages, prompt);
-
-        // Format files for Claude API if any are provided
-        const formattedFiles = files.length > 0 ? await formatFilesForClaude(files) : [];
-
         // Construct request payload
         const payload = {
             model: modelId,
-            messages: formattedMessages,
+            messages: [...messages, { role: 'user', content: prompt }],
             max_tokens: 4096,
             extended_thinking: extendedThinking && modelId === CLAUDE_MODELS.CLAUDE_3_7_SONNET,
         };
 
         // Add files to payload if any are provided
-        if (formattedFiles.length > 0) {
-            payload.attachments = formattedFiles;
+        if (files.length > 0) {
+            payload.attachments = files;
         }
 
         // Send request to our API route
@@ -66,67 +60,6 @@ export async function sendMessageToClaude(prompt, modelId, messages = [], files 
 }
 
 /**
- * Format conversation messages into Claude API format
- *
- * @param {Array} messages - Previous messages in the conversation
- * @param {string} currentPrompt - The current user prompt
- * @returns {Array} - Formatted messages for Claude API
- */
-function formatMessagesForClaude(messages, currentPrompt) {
-    const formattedMessages = messages.map(message => ({
-        role: message.sender === 'user' ? 'user' : 'assistant',
-        content: message.text
-    }));
-
-    // Add the current prompt as the last user message
-    formattedMessages.push({
-        role: 'user',
-        content: currentPrompt
-    });
-
-    return formattedMessages;
-}
-
-/**
- * Format files for Claude API
- *
- * @param {Array} files - Files to include in the message
- * @returns {Array} - Formatted file objects for Claude API
- */
-async function formatFilesForClaude(files) {
-    const formattedFiles = [];
-
-    for (const file of files) {
-        // Convert file to base64
-        const base64Content = await fileToBase64(file);
-
-        formattedFiles.push({
-            type: 'file',
-            file_id: file.id,
-            media_type: file.type,
-            data: base64Content.split(',')[1] // Remove data URL prefix
-        });
-    }
-
-    return formattedFiles;
-}
-
-/**
- * Convert a file to base64 format
- *
- * @param {File} file - File to convert
- * @returns {Promise<string>} - Promise containing base64 data URL
- */
-function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.readAsDataURL(file);
-        reader.onload = () => resolve(reader.result);
-        reader.onerror = error => reject(error);
-    });
-}
-
-/**
  * Stream a response from Claude API
  *
  * @param {string} prompt - The user's message
@@ -139,24 +72,18 @@ function fileToBase64(file) {
  */
 export async function streamResponseFromClaude(prompt, modelId, messages = [], files = [], extendedThinking = false, onChunk) {
     try {
-        // Format messages for Claude API
-        const formattedMessages = formatMessagesForClaude(messages, prompt);
-
-        // Format files for Claude API if any are provided
-        const formattedFiles = files.length > 0 ? await formatFilesForClaude(files) : [];
-
         // Construct request payload
         const payload = {
             model: modelId,
-            messages: formattedMessages,
+            messages: [...messages, { role: 'user', content: prompt }],
             max_tokens: 4096,
             stream: true,
             extended_thinking: extendedThinking && modelId === CLAUDE_MODELS.CLAUDE_3_7_SONNET,
         };
 
         // Add files to payload if any are provided
-        if (formattedFiles.length > 0) {
-            payload.attachments = formattedFiles;
+        if (files.length > 0) {
+            payload.attachments = files;
         }
 
         // Send request to our API route
@@ -169,8 +96,18 @@ export async function streamResponseFromClaude(prompt, modelId, messages = [], f
         });
 
         if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Claude API error: ${errorData.error?.message || response.statusText}`);
+            const errorText = await response.text();
+            let errorMessage = `Claude API error: ${response.statusText}`;
+            try {
+                const errorData = JSON.parse(errorText);
+                if (errorData.error?.message) {
+                    errorMessage = `Claude API error: ${errorData.error.message}`;
+                }
+            } catch (e) {
+                // If parsing fails, use the error text
+                errorMessage = `Claude API error: ${errorText || response.statusText}`;
+            }
+            throw new Error(errorMessage);
         }
 
         // Setup streaming response handling
@@ -178,7 +115,12 @@ export async function streamResponseFromClaude(prompt, modelId, messages = [], f
         const decoder = new TextDecoder('utf-8');
         let buffer = '';
 
-        // Read stream chunks
+        // Validate that we're getting a streaming response
+        if (!response.headers.get('content-type')?.includes('text/event-stream')) {
+            throw new Error('API did not return a streaming response');
+        }
+
+        // Process the stream
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
@@ -209,6 +151,21 @@ export async function streamResponseFromClaude(prompt, modelId, messages = [], f
 
     } catch (error) {
         console.error('Error streaming response from Claude:', error);
+
+        // Handle the streaming error
+        await handleStreamingError(error.message, onChunk);
+
         throw error;
     }
+}
+
+/**
+ * Handle connection errors when streaming fails
+ *
+ * @param {string} error - The error message
+ * @param {Function} onChunk - Callback for each chunk
+ */
+async function handleStreamingError(error, onChunk) {
+    const errorMessage = `Error connecting to Claude API: ${error}. Please check your API key and try again.`;
+    onChunk(errorMessage);
 }

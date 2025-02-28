@@ -2,12 +2,8 @@
 
 import { createContext, useState, useContext, useEffect } from 'react';
 import { useAuth } from './AuthContext';
-
-// Claude model identifiers
-export const CLAUDE_MODELS = {
-    CLAUDE_3_5_SONNET: 'claude-3-5-sonnet-20240620',
-    CLAUDE_3_7_SONNET: 'claude-3-7-sonnet-20240307',
-};
+import { sendMessageToClaude, streamResponseFromClaude, CLAUDE_MODELS } from '../lib/api/claude';
+import { v4 as uuidv4 } from 'uuid';
 
 // Create context
 const ChatContext = createContext();
@@ -29,6 +25,7 @@ export function ChatProvider({ children }) {
         icon: '🧠'
     });
     const [extendedThinking, setExtendedThinking] = useState(false);
+    const [streamingMessage, setStreamingMessage] = useState(null);
 
     // Load chats from localStorage when user changes
     useEffect(() => {
@@ -69,16 +66,10 @@ export function ChatProvider({ children }) {
                     setCurrentChat(parsedChats[0]);
                 }
             } else {
-                // Initialize with demo chats if none exist
-                const initialChats = [
-                    { id: 'chat1', title: 'Research Assistant', lastMessage: 'What are the latest developments in quantum computing?', timestamp: new Date().toISOString(), folderId: null },
-                    { id: 'chat2', title: 'Code Helper', lastMessage: 'Can you explain async/await in JavaScript?', timestamp: new Date().toISOString(), folderId: null },
-                    { id: 'chat3', title: 'Travel Planning', lastMessage: 'I need suggestions for a 7-day trip to Japan.', timestamp: new Date().toISOString(), folderId: null },
-                ];
-
-                setChats(initialChats);
-                setCurrentChat(initialChats[0]);
-                saveChats(initialChats);
+                // Start with no chats
+                setChats([]);
+                setCurrentChat(null);
+                saveChats([]);
             }
         } catch (error) {
             console.error('Error loading chats:', error);
@@ -97,15 +88,9 @@ export function ChatProvider({ children }) {
             if (savedFolders) {
                 setFolders(JSON.parse(savedFolders));
             } else {
-                // Initialize with demo folders if none exist
-                const initialFolders = [
-                    { id: 'folder1', name: 'Work Projects', chats: 0 },
-                    { id: 'folder2', name: 'Personal', chats: 0 },
-                    { id: 'folder3', name: 'Learning', chats: 0 },
-                ];
-
-                setFolders(initialFolders);
-                saveFolders(initialFolders);
+                // Start with an empty folders list
+                setFolders([]);
+                saveFolders([]);
             }
         } catch (error) {
             console.error('Error loading folders:', error);
@@ -211,6 +196,44 @@ export function ChatProvider({ children }) {
     };
 
     /**
+     * Process files for API submission
+     *
+     * @param {Array} files - Array of file objects
+     * @returns {Promise<Array>} - Processed file objects for API
+     */
+    const processFilesForAPI = async (files) => {
+        const processedFiles = [];
+
+        for (const file of files) {
+            // Convert file to base64
+            const base64Content = await fileToBase64(file);
+
+            processedFiles.push({
+                file_id: uuidv4(),
+                media_type: file.type,
+                data: base64Content.split(',')[1] // Remove data URL prefix
+            });
+        }
+
+        return processedFiles;
+    };
+
+    /**
+     * Convert a file to base64 format
+     *
+     * @param {File} file - File to convert
+     * @returns {Promise<string>} - Promise containing base64 data URL
+     */
+    const fileToBase64 = (file) => {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = error => reject(error);
+        });
+    };
+
+    /**
      * Send a message to AI model
      *
      * @param {string} message - Message text
@@ -233,7 +256,7 @@ export function ChatProvider({ children }) {
             sender: 'user',
             text: message,
             files: files.map(file => ({
-                id: file.name,
+                id: uuidv4(),
                 name: file.name,
                 type: file.type,
                 size: file.size,
@@ -265,44 +288,70 @@ export function ChatProvider({ children }) {
         setIsThinking(true);
 
         try {
-            // For MVP, we'll simulate AI response after a delay
-            const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+            // Process files for API if any
+            const processedFiles = files.length > 0 ? await processFilesForAPI(files) : [];
 
-            // Wait 1-3 seconds to simulate thinking
-            await delay(Math.random() * 2000 + 1000);
-
-            // Create AI response
-            let responseText = '';
-
-            if (message.trim()) {
-                // Simple response logic based on the message
-                if (message.toLowerCase().includes('hello') || message.toLowerCase().includes('hi')) {
-                    responseText = `Hello there! How can I assist you today?`;
-                } else if (message.toLowerCase().includes('help')) {
-                    responseText = `I'd be happy to help! What specific question or task do you need assistance with?`;
-                } else if (message.toLowerCase().includes('thanks') || message.toLowerCase().includes('thank you')) {
-                    responseText = `You're welcome! Feel free to ask if you need anything else.`;
-                } else {
-                    responseText = `I'm processing your request "${message}". In a full implementation, I would call the ${selectedModel.name} API here.`;
-                }
-            } else if (files.length > 0) {
-                // Response for file uploads
-                const fileNames = files.map(f => f.name).join(', ');
-                responseText = `I've received ${files.length} file(s): ${fileNames}. In a full implementation, I would process these files using ${selectedModel.name}.`;
-            }
-
-            // Add AI message to chat
+            // Prepare AI message placeholder for streaming
+            const aiMessageId = `msg_${Date.now() + 1}`;
             const aiMessage = {
-                id: `msg_${Date.now() + 1}`,
+                id: aiMessageId,
                 sender: 'ai',
-                text: responseText,
+                text: '',
                 model: selectedModel.id,
                 timestamp: new Date().toISOString(),
             };
 
-            const messagesWithAi = [...updatedMessages, aiMessage];
-            setChatMessages(messagesWithAi);
-            saveChatMessages(chatId, messagesWithAi);
+            // We'll use streaming for a better user experience
+            setStreamingMessage(aiMessage);
+            const messagesWithAiPlaceholder = [...updatedMessages, aiMessage];
+            setChatMessages(messagesWithAiPlaceholder);
+
+            // Get previous messages for context (excluding the user's current message)
+            const previousMessages = chatMessages.map(msg => ({
+                role: msg.sender === 'user' ? 'user' : 'assistant',
+                content: msg.text
+            }));
+
+            // Use streaming response
+            let fullResponse = '';
+            await streamResponseFromClaude(
+                message,
+                selectedModel.id,
+                previousMessages,
+                processedFiles,
+                extendedThinking,
+                (chunk) => {
+                    fullResponse += chunk;
+                    setStreamingMessage(prev => ({
+                        ...prev,
+                        text: fullResponse
+                    }));
+                }
+            );
+
+            // Complete the message with the full response
+            const completedAiMessage = {
+                ...aiMessage,
+                text: fullResponse
+            };
+
+            // Replace the streaming message with the completed one
+            const finalMessages = [...updatedMessages, completedAiMessage];
+            setChatMessages(finalMessages);
+            saveChatMessages(chatId, finalMessages);
+
+            // Update the chat's last message to indicate the AI's response
+            const chatsWithResponse = chats.map(chat => {
+                if (chat.id === chatId) {
+                    return {
+                        ...chat,
+                        lastMessage: fullResponse.slice(0, 50) + (fullResponse.length > 50 ? '...' : '')
+                    };
+                }
+                return chat;
+            });
+            setChats(chatsWithResponse);
+            saveChats(chatsWithResponse);
 
         } catch (error) {
             console.error('Error sending message:', error);
@@ -321,6 +370,62 @@ export function ChatProvider({ children }) {
 
         } finally {
             setIsThinking(false);
+            setStreamingMessage(null);
+        }
+    };
+
+    /**
+     * Delete a chat
+     *
+     * @param {string} chatId - ID of chat to delete
+     */
+    const deleteChat = (chatId) => {
+        if (!chatId) return;
+
+        // Remove chat from list
+        const updatedChats = chats.filter(chat => chat.id !== chatId);
+        setChats(updatedChats);
+        saveChats(updatedChats);
+
+        // Remove chat messages
+        if (typeof window !== 'undefined' && user) {
+            localStorage.removeItem(`messages_${user.id}_${chatId}`);
+        }
+
+        // If current chat is deleted, set current chat to first available or null
+        if (currentChat && currentChat.id === chatId) {
+            setCurrentChat(updatedChats.length > 0 ? updatedChats[0] : null);
+        }
+
+        // Update folder counts if needed
+        const deletedChat = chats.find(chat => chat.id === chatId);
+        if (deletedChat && deletedChat.folderId) {
+            updateFolderChatCount(deletedChat.folderId);
+        }
+    };
+
+    /**
+     * Rename a chat
+     *
+     * @param {string} chatId - Chat ID to rename
+     * @param {string} newTitle - New title for the chat
+     */
+    const renameChat = (chatId, newTitle) => {
+        if (!chatId || !newTitle.trim()) return;
+
+        const updatedChats = chats.map(chat => {
+            if (chat.id === chatId) {
+                return { ...chat, title: newTitle };
+            }
+            return chat;
+        });
+
+        setChats(updatedChats);
+        saveChats(updatedChats);
+
+        // Update current chat if it's the one being renamed
+        if (currentChat && currentChat.id === chatId) {
+            setCurrentChat({ ...currentChat, title: newTitle });
         }
     };
 
@@ -334,11 +439,14 @@ export function ChatProvider({ children }) {
         extendedThinking,
         isThinking,
         loading,
+        streamingMessage,
         setCurrentChat,
         setSelectedModel,
         setExtendedThinking,
         createChat,
         sendMessage,
+        deleteChat,
+        renameChat,
         loadChatMessages
     };
 
